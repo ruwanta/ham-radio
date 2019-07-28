@@ -21,6 +21,7 @@ limitations under the License.
 #include <EEPROM.h>
 #include <SimpleRotary.h>
 #include <SoftwareSerial.h>
+#include <HardwareSerial.h>
 #include <DRA818.h>
 
 
@@ -90,6 +91,7 @@ volatile int tunerChangedFlags = 0x00;
 SimpleRotary rotary(ENCODER_0_PINA, ENCODER_0_PINB, ENCODER_0_PUSH);
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 SoftwareSerial *dra_serial;
+//HardwareSerial *dra_serial;
 DRA818 *dra;
 
 void setup() {
@@ -97,6 +99,7 @@ void setup() {
   FREQ_STEP_MULTIPLIER = powint(10, 9 - FREQ_DISPLAY_DIGITS);
 
   Serial.begin(9600);
+  
   loadEepromData();
   bootstrapData();
     
@@ -128,15 +131,17 @@ void loop() {
  * Sets up the DRA 818 module
  */
 void setupDra818() {
-  dra_serial = new SoftwareSerial(SOFTWARE_SERIAL_TX, SOFTWARE_SERIAL_RX);
+  dra_serial = new SoftwareSerial(SOFTWARE_SERIAL_RX, SOFTWARE_SERIAL_TX);
+//  dra_serial = new HardwareSerial(SOFTWARE_SERIAL_TX, SOFTWARE_SERIAL_RX);
  
-  // all in one configuration
-  float draFreqTx = txFreq / MHz;
-  float draFreqRx = rxFreq / MHz;
+  float draFreqTx = (float)txFreq / MHz;
+  float draFreqRx = (float)rxFreq / MHz;
   
-//  // object-style configuration
   dra = new DRA818(dra_serial, DRA818_VHF);
-//  dra->handshake();
+#ifdef DRA818_DEBUG  
+  dra->set_log(&Serial);
+#endif
+  dra->handshake();
   dra->group(DRA818_12K5, draFreqTx, draFreqRx, 0, squelch, 0);
   dra->volume(volume);
   dra->filters(true, true, true);
@@ -146,14 +151,16 @@ void setupDra818() {
  * Handles the vaue change for the RDA 818 Tuner
  */
 void handleTunerChange() {
-  if(tunerChangedFlags & TUNER_VOLUME_CHANGED != 0) {
+  Serial.print(F("handleTunerChange "));
+  Serial.println(tunerChangedFlags);
+  if((tunerChangedFlags & TUNER_VOLUME_CHANGED) != 0) {
     dra->volume(volume);
   }
-  if(tunerChangedFlags & TUNER_SQUELCH_CHANGED != 0 ||
-    tunerChangedFlags & TUNER_RX_F_CHANGED != 0 ||
-    tunerChangedFlags & TUNER_TX_F_CHANGED != 0) {
-    float draFreqTx = txFreq / MHz;
-    float draFreqRx = rxFreq / MHz;
+  if((tunerChangedFlags & TUNER_SQUELCH_CHANGED) != 0 ||
+    (tunerChangedFlags & TUNER_RX_F_CHANGED) != 0 ||
+    (tunerChangedFlags & TUNER_TX_F_CHANGED) != 0) {
+    float draFreqTx = (float)txFreq / MHz;
+    float draFreqRx = (float) rxFreq / MHz;    
     dra->group(DRA818_12K5, draFreqTx, draFreqRx, 0, squelch, 0);
   }
 
@@ -167,10 +174,12 @@ void readRoteryEncoder() {
   i = rotary.rotate();
 
   if ( i == 1 ) {
+//    Serial.println(F("Rotate CW"));
     handleRoteryClockwise();
   }
 
   if ( i == 2 ) {
+//    Serial.println(F("Rotete CCW"));
     handleRoteryCounterClockwise();
   }
 
@@ -216,10 +225,12 @@ void handleRoteryClockwise() {
       break;
     case MODE_EDIT_RX_FREQ:
       rxFreq = rxFreq +10000;
+      tunerChangedFlags = tunerChangedFlags | TUNER_RX_F_CHANGED;
       displayChanged = true; 
       break;  
     case MODE_EDIT_TX_FREQ:
       txFreq = txFreq +10000;
+      tunerChangedFlags = tunerChangedFlags | TUNER_TX_F_CHANGED;
       displayChanged = true; 
       break;  
   }
@@ -260,6 +271,7 @@ void handleRoteryCounterClockwise() {
         } else {
           rxFreq = rxFreq - frequencyStep;      
         }
+        tunerChangedFlags = tunerChangedFlags | TUNER_RX_F_CHANGED;
         displayChanged = true; 
       }
       break;  
@@ -275,6 +287,7 @@ void handleRoteryCounterClockwise() {
         } else {
           txFreq = txFreq - frequencyStep;
         }
+        tunerChangedFlags = tunerChangedFlags | TUNER_TX_F_CHANGED;
         displayChanged = true; 
       }  
       break;  
