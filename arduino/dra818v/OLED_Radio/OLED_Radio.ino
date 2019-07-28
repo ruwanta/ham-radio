@@ -20,6 +20,10 @@ limitations under the License.
 #include <Adafruit_SSD1306.h>
 #include <EEPROM.h>
 #include <SimpleRotary.h>
+#include <SoftwareSerial.h>
+#include <DRA818.h>
+
+
 
 #define SCREEN_WIDTH 128 // OLED display width, in pixels
 #define SCREEN_HEIGHT 64 // OLED display height, in pixels
@@ -29,7 +33,13 @@ limitations under the License.
 
 #define FREQ_DISPLAY_DIGITS 7
 #define MHZ_DEVISOR   1000000
-#define EEPROM_ADDR_LAST_FREQ_POSITION  0x00
+#define EEPROM_ADDR_RX_FREQ_POSITION  0x00
+#define EEPROM_ADDR_TX_FREQ_POSITION  0x04
+#define EEPROM_ADDR_VOLUME_POSITION  0x10
+#define EEPROM_ADDR_SQUELCH_POSITION  0x12
+#define EEPROM_ADDR_RX_CTSS_POSITION  0x20
+#define EEPROM_ADDR_TX_CTSS_POSITION  0x21
+#define EEPROM_ADDR_LAST_FREQ_POSITION  0x30
 
 // Modes, which changes the screen layout and what displayes in the screen
 #define MODE_MAIN_SCREEN  0
@@ -47,9 +57,18 @@ limitations under the License.
 #define ENCODER_0_PINA  2
 #define ENCODER_0_PINB  3
 #define ENCODER_0_PUSH  4
+#define SOFTWARE_SERIAL_TX   5
+#define SOFTWARE_SERIAL_RX   6
 
 //Radio DRA818 related constants
 #define MAX_VOLUME  8
+#define MAX_SQUELCH 8
+#define TUNER_RX_F_CHANGED    1
+#define TUNER_TX_F_CHANGED    2
+#define TUNER_VOLUME_CHANGED  4
+#define TUNER_SQUELCH_CHANGED 8
+
+#define MHz   1000000;
 
 
 //Macros
@@ -60,27 +79,27 @@ long FREQ_STEP_MULTIPLIER =1;
 long rxFreq = 144000000;
 long txFreq = 144600000;
 int volume = 3;
-byte squelch = 5;
+int squelch = 1;
 int currentMode = MODE_MAIN_SCREEN;
 int currentSubMode = SUB_MODE_NULL;
 int freqSetPosition = 2;
-int frequencyStep = 100000;
+long frequencyStep = 100000;
 volatile bool displayChanged  = false;
+volatile int tunerChangedFlags = 0x00;
 
 SimpleRotary rotary(ENCODER_0_PINA, ENCODER_0_PINB, ENCODER_0_PUSH);
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+SoftwareSerial *dra_serial;
+DRA818 *dra;
 
 void setup() {
 
   FREQ_STEP_MULTIPLIER = powint(10, 9 - FREQ_DISPLAY_DIGITS);
 
   Serial.begin(9600);
-  EEPROM.get(EEPROM_ADDR_LAST_FREQ_POSITION, freqSetPosition);
-  if(freqSetPosition < 0 || freqSetPosition >FREQ_DISPLAY_DIGITS) {
-    freqSetPosition = 2;
-    saveCurrentFreqEditPosition();
-  }
-
+  loadEepromData();
+  bootstrapData();
+    
   frequencyStep = calculateFrequencyStep();
 
   // SSD1306_SWITCHCAPVCC = generate display voltage from 3.3V internally
@@ -90,6 +109,7 @@ void setup() {
   }
 
   drawRxTxFreqScreen();
+  setupDra818();
 }
 
 void loop() {
@@ -98,6 +118,46 @@ void loop() {
     drawRxTxFreqScreen();
     displayChanged = false;
   }
+  if(tunerChangedFlags != 0) {
+    handleTunerChange();
+    saveEepromData();
+  }
+}
+
+/**
+ * Sets up the DRA 818 module
+ */
+void setupDra818() {
+  dra_serial = new SoftwareSerial(SOFTWARE_SERIAL_TX, SOFTWARE_SERIAL_RX);
+ 
+  // all in one configuration
+  float draFreqTx = txFreq / MHz;
+  float draFreqRx = rxFreq / MHz;
+  
+//  // object-style configuration
+  dra = new DRA818(dra_serial, DRA818_VHF);
+//  dra->handshake();
+  dra->group(DRA818_12K5, draFreqTx, draFreqRx, 0, squelch, 0);
+  dra->volume(volume);
+  dra->filters(true, true, true);
+}
+
+/**
+ * Handles the vaue change for the RDA 818 Tuner
+ */
+void handleTunerChange() {
+  if(tunerChangedFlags & TUNER_VOLUME_CHANGED != 0) {
+    dra->volume(volume);
+  }
+  if(tunerChangedFlags & TUNER_SQUELCH_CHANGED != 0 ||
+    tunerChangedFlags & TUNER_RX_F_CHANGED != 0 ||
+    tunerChangedFlags & TUNER_TX_F_CHANGED != 0) {
+    float draFreqTx = txFreq / MHz;
+    float draFreqRx = rxFreq / MHz;
+    dra->group(DRA818_12K5, draFreqTx, draFreqRx, 0, squelch, 0);
+  }
+
+  tunerChangedFlags = 0x00;
 }
 
 void readRoteryEncoder() {
@@ -118,7 +178,11 @@ void readRoteryEncoder() {
   // 0 = not pushed, 1 = pushed, 2 = long pushed (after 1000 ms)
   i = rotary.pushType(1000);
   if ( i == 1 ) {
-    int nextMode = (currentMode +1) % MAX_MODE;
+    int nextMode = currentMode +1;
+    //Roll the mode menu to main screen.
+    if(nextMode > MAX_MODE) {
+      nextMode = MODE_MAIN_SCREEN;
+    }
     currentMode = nextMode ; 
     displayChanged = true;  
   } else if (i == 2) {
@@ -133,9 +197,22 @@ void readRoteryEncoder() {
 void handleRoteryClockwise() {
   switch (currentMode) {
     case MODE_SET_VOLUME :
-      volume ++;
-      if(volume > MAX_VOLUME) {volume = MAX_VOLUME;}
-      displayChanged = true; 
+      {
+        int newVolume = volume +1;
+        if(newVolume > MAX_VOLUME) {newVolume = MAX_VOLUME;}
+        volume = newVolume;
+        displayChanged = true; 
+        tunerChangedFlags = tunerChangedFlags | TUNER_VOLUME_CHANGED;
+      }
+      break;
+    case MODE_SET_SQUELCH :
+      {
+        int newSqeuelch = squelch +1;
+        if(newSqeuelch > MAX_SQUELCH) {newSqeuelch = MAX_SQUELCH;}
+        squelch = newSqeuelch;
+        tunerChangedFlags = tunerChangedFlags | TUNER_SQUELCH_CHANGED;
+        displayChanged = true; 
+      }
       break;
     case MODE_EDIT_RX_FREQ:
       rxFreq = rxFreq +10000;
@@ -154,35 +231,52 @@ void handleRoteryClockwise() {
 void handleRoteryCounterClockwise() {
     switch (currentMode) {
     case MODE_SET_VOLUME :
-      volume --;
-      if(volume < 0) {volume = 0;}
-      displayChanged = true; 
+      {
+        int newVolume = volume -1;
+        if(newVolume < 0) {newVolume = 0;}
+        volume = newVolume;
+        tunerChangedFlags = tunerChangedFlags | TUNER_VOLUME_CHANGED;
+        displayChanged = true; 
+      }
+      break;
+    case MODE_SET_SQUELCH :
+      {
+        int newSquelch = squelch -1;
+        if(newSquelch < 0) {newSquelch = 0;}
+        squelch = newSquelch;
+        tunerChangedFlags = tunerChangedFlags | TUNER_SQUELCH_CHANGED;
+        displayChanged = true;
+      }   
       break;
     case MODE_EDIT_RX_FREQ:
-      if(currentSubMode == SUB_MODE_SELECT_FREQ_NUMERAL) {
-        int newPosition = freqSetPosition --;
-        if(newPosition <= 0) {
-          newPosition = 0;
+      {
+        if(currentSubMode == SUB_MODE_SELECT_FREQ_NUMERAL) {
+          int newPosition = freqSetPosition --;
+          if(newPosition <= 0) {
+            newPosition = 0;
+          }
+          currentSubMode = newPosition;
+          frequencyStep = calculateFrequencyStep();
+        } else {
+          rxFreq = rxFreq - frequencyStep;      
         }
-        currentSubMode = newPosition;
-        frequencyStep = calculateFrequencyStep();
-      } else {
-        rxFreq = rxFreq - frequencyStep;      
+        displayChanged = true; 
       }
-      displayChanged = true; 
       break;  
     case MODE_EDIT_TX_FREQ:
-      if(currentSubMode == SUB_MODE_SELECT_FREQ_NUMERAL) {
-        int newPosition = freqSetPosition --;
-        if(newPosition <= 0) {
-          newPosition = 0;
+      {
+        if(currentSubMode == SUB_MODE_SELECT_FREQ_NUMERAL) {
+          int newPosition = freqSetPosition --;
+          if(newPosition <= 0) {
+            newPosition = 0;
+          }
+          currentSubMode = newPosition;
+          frequencyStep = calculateFrequencyStep();
+        } else {
+          txFreq = txFreq - frequencyStep;
         }
-        currentSubMode = newPosition;
-        frequencyStep = calculateFrequencyStep();
-      } else {
-        txFreq = txFreq - frequencyStep;
-      }
-      displayChanged = true; 
+        displayChanged = true; 
+      }  
       break;  
   }
 }
@@ -204,6 +298,7 @@ void handleRoteryLongPush() {
       break;  
   }
 }
+
 
 /**
  * Draws the main screen, which contains two frequency lines
@@ -279,8 +374,12 @@ void drawVolume(int x, int y, int h) {
  * h is the height of the volume indicator bar
  */
 void drawSquelch(int x, int y, int h) {
+  int sqelchToScale = (squelch * 50) / 8;
   display.drawRect(x, y, 50, h, WHITE);
-  display.fillRect(x, y, 25, h, WHITE);
+  display.fillRect(x, y, sqelchToScale, h, WHITE);
+  if(currentMode == MODE_SET_SQUELCH) {
+    display.fillRect(x + sqelchToScale, y-1, 2, h+3, WHITE);
+  }
 }
 
 
@@ -313,6 +412,28 @@ long calculateFrequencyStep() {
   return powint(10, freqSetPosition) *100;
 }
 
-void saveCurrentFreqEditPosition() {
-  EEPROM.update(EEPROM_ADDR_LAST_FREQ_POSITION, freqSetPosition);
+void loadEepromData() {
+  EEPROM.get(EEPROM_ADDR_RX_FREQ_POSITION, rxFreq);
+  EEPROM.get(EEPROM_ADDR_TX_FREQ_POSITION, txFreq);
+  EEPROM.get(EEPROM_ADDR_VOLUME_POSITION, volume);
+  EEPROM.get(EEPROM_ADDR_SQUELCH_POSITION, squelch);
+  
+  EEPROM.get(EEPROM_ADDR_LAST_FREQ_POSITION, freqSetPosition);
+}
+
+void saveEepromData() {
+  EEPROM.put(EEPROM_ADDR_RX_FREQ_POSITION, rxFreq);
+  EEPROM.put(EEPROM_ADDR_TX_FREQ_POSITION, txFreq);
+  EEPROM.put(EEPROM_ADDR_VOLUME_POSITION, volume);
+  EEPROM.put(EEPROM_ADDR_SQUELCH_POSITION, squelch);
+    
+  EEPROM.put(EEPROM_ADDR_LAST_FREQ_POSITION, freqSetPosition);
+}
+
+void bootstrapData() {
+  if(rxFreq < 144000000 || rxFreq > 146000000) {rxFreq = 144000000; }
+  if(txFreq < 144000000 || txFreq > 146000000) {txFreq = 144000000; }
+  if(volume < 0 || volume > 7) {volume = 1; }
+  if(squelch < 0 || squelch > 7) {squelch = 2; }
+  if(freqSetPosition < 0 || freqSetPosition > FREQ_DISPLAY_DIGITS) {freqSetPosition = 2; }
 }
